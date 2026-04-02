@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from fastapi import FastAPI, HTTPException
+from psycopg2.extras import Json
 
 from .config import settings
 from .db import get_conn, get_cursor
@@ -66,7 +67,7 @@ def _write_audit(cur, event_type: str, payload: dict):
         INSERT INTO audit_logs(event_type, payload_json, created_at)
         VALUES (%s, %s, %s)
         """,
-        (event_type, payload, now),
+        (event_type, Json(payload or {}), now),
     )
 
 
