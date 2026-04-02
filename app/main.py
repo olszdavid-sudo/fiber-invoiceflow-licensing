@@ -1,11 +1,13 @@
 from datetime import timedelta
+import secrets
 
 from fastapi import FastAPI, HTTPException
 from psycopg2.extras import Json
+from fastapi.responses import HTMLResponse
 
 from .config import settings
 from .db import get_conn, get_cursor
-from .schemas import LicenseRequest, DeactivateRequest
+from .schemas import LicenseRequest, DeactivateRequest, AdminGenerateRequest
 from .security import now_utc, hash_license_key, sign_payload
 
 app = FastAPI(title="Fiber License API", version="1.0.0")
@@ -71,9 +73,125 @@ def _write_audit(cur, event_type: str, payload: dict):
     )
 
 
+def _generate_raw_license_key() -> str:
+    # 16 bytes -> 32 hex chars, format zgodny z dotychczasowymi kluczami.
+    return "FIBER-" + secrets.token_hex(16).upper()
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return """
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fiber License Admin</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f6f7fb; margin:0; }
+    .wrap { max-width: 760px; margin: 36px auto; background:#fff; border:1px solid #d8deea; border-radius:14px; padding:22px; }
+    h2 { margin:0 0 14px; }
+    label { display:block; margin:10px 0 6px; font-weight:600; }
+    input { width:100%; padding:10px; border:1px solid #c8d0dd; border-radius:8px; }
+    button { margin-top:14px; padding:10px 14px; border:0; border-radius:8px; background:#0b5fff; color:#fff; font-weight:700; cursor:pointer; }
+    pre { margin-top:14px; padding:12px; background:#0b1324; color:#d6e6ff; border-radius:8px; min-height:80px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Fiber - Panel Licencji</h2>
+    <label>ADMIN_API_KEY</label>
+    <input id="admin_api_key" type="password" placeholder="Wpisz klucz admina" />
+    <label>app_id</label>
+    <input id="app_id" value="fiber_invoiceflow" />
+    <label>max_devices</label>
+    <input id="max_devices" type="number" value="1" min="1" max="100" />
+    <label>validity_days</label>
+    <input id="validity_days" type="number" value="365" min="1" />
+    <button id="gen">Wygeneruj klucz</button>
+    <pre id="out">Gotowe.</pre>
+  </div>
+  <script>
+    document.getElementById("gen").addEventListener("click", async () => {
+      const payload = {
+        admin_api_key: document.getElementById("admin_api_key").value.trim(),
+        app_id: document.getElementById("app_id").value.trim(),
+        max_devices: Number(document.getElementById("max_devices").value || 1),
+        validity_days: Number(document.getElementById("validity_days").value || 365),
+      };
+      const out = document.getElementById("out");
+      out.textContent = "Generowanie...";
+      try {
+        const res = await fetch("/admin/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        out.textContent = "Blad: " + String(e);
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.post("/admin/generate")
+def admin_generate(req: AdminGenerateRequest):
+    if not settings.admin_api_key:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured on server.")
+    if req.admin_api_key != settings.admin_api_key:
+        raise HTTPException(status_code=401, detail="Invalid admin API key.")
+
+    raw_key = _generate_raw_license_key()
+    key_hash = hash_license_key(raw_key)
+    now = now_utc()
+    expires = now + timedelta(days=int(req.validity_days))
+
+    with get_conn() as conn, get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO licenses(app_id, license_key_hash, status, max_devices, expires_at, created_at, updated_at)
+            VALUES (%s, %s, 'active', %s, %s, %s, %s)
+            ON CONFLICT (app_id, license_key_hash)
+            DO UPDATE SET
+              status='active',
+              max_devices=EXCLUDED.max_devices,
+              expires_at=EXCLUDED.expires_at,
+              updated_at=EXCLUDED.updated_at
+            RETURNING id, expires_at
+            """,
+            (req.app_id, key_hash, int(req.max_devices), expires, now, now),
+        )
+        row = cur.fetchone()
+        _write_audit(
+            cur,
+            "admin_generate_license",
+            {
+                "app_id": req.app_id,
+                "max_devices": req.max_devices,
+                "validity_days": req.validity_days,
+                "license_id": int(row["id"]),
+            },
+        )
+
+    return sign_payload(
+        {
+            "status": "ok",
+            "license_key": raw_key,
+            "app_id": req.app_id,
+            "max_devices": int(req.max_devices),
+            "expires_at": row["expires_at"].isoformat() if row and row.get("expires_at") else "",
+        }
+    )
 
 
 @app.post("/trial/start")
