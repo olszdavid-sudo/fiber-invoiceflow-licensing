@@ -62,6 +62,31 @@ def _activation_count(cur, license_id: int):
     return int(cur.fetchone()["c"])
 
 
+def _active_machine_count_for_app(cur, app_id: str) -> int:
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT machine_id)::int AS c
+        FROM license_activations
+        WHERE app_id=%s AND status='active'
+        """,
+        (app_id,),
+    )
+    return int(cur.fetchone()["c"])
+
+
+def _is_machine_active_for_app(cur, app_id: str, machine_id: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM license_activations
+        WHERE app_id=%s AND machine_id=%s AND status='active'
+        LIMIT 1
+        """,
+        (app_id, machine_id),
+    )
+    return cur.fetchone() is not None
+
+
 def _write_audit(cur, event_type: str, payload: dict):
     now = now_utc()
     cur.execute(
@@ -112,7 +137,7 @@ def admin_page():
     <label>max_devices</label>
     <input id="max_devices" type="number" value="1" min="1" max="100" />
     <label>validity_days</label>
-    <input id="validity_days" type="number" value="365" min="1" />
+    <input id="validity_days" type="number" value="30" min="1" />
     <button id="gen">Wygeneruj klucz</button>
     <pre id="out">Gotowe.</pre>
   </div>
@@ -122,7 +147,7 @@ def admin_page():
         admin_api_key: document.getElementById("admin_api_key").value.trim(),
         app_id: document.getElementById("app_id").value.trim(),
         max_devices: Number(document.getElementById("max_devices").value || 1),
-        validity_days: Number(document.getElementById("validity_days").value || 365),
+        validity_days: Number(document.getElementById("validity_days").value || 30),
       };
       const out = document.getElementById("out");
       out.textContent = "Generowanie...";
@@ -224,6 +249,15 @@ def validate(req: LicenseRequest):
                 }
             )
 
+        if settings.require_key_on_first_run:
+            _write_audit(cur, "validate_needs_activation", req.model_dump())
+            return sign_payload(
+                {
+                    "status": "needs_activation",
+                    "message": "Aby uruchomić program, podaj kod licencji. Kod aktywuje dostęp na określony czas.",
+                }
+            )
+
         trial = _upsert_trial(cur, req.app_id, req.machine_id)
         if now <= trial["trial_end"]:
             _write_audit(cur, "validate_trial", req.model_dump())
@@ -273,6 +307,20 @@ def activate(req: LicenseRequest):
         existing = cur.fetchone()
         now = now_utc()
         if not existing:
+            # Globalny limit osób/komputerów dla całej aplikacji (np. 2 osoby).
+            app_limit = int(settings.max_active_machines_per_app or 0)
+            if app_limit > 0:
+                machine_already_active = _is_machine_active_for_app(cur, req.app_id, req.machine_id)
+                app_active_count = _active_machine_count_for_app(cur, req.app_id)
+                if (not machine_already_active) and app_active_count >= app_limit:
+                    _write_audit(cur, "activate_app_limit_reached", req.model_dump())
+                    return sign_payload(
+                        {
+                            "status": "app_limit_reached",
+                            "message": f"Osiągnięto limit aktywnych stanowisk dla aplikacji: {app_limit}.",
+                        }
+                    )
+
             cnt = _activation_count(cur, lic["id"])
             if cnt >= int(lic["max_devices"]):
                 _write_audit(cur, "activate_limit_reached", req.model_dump())
