@@ -235,6 +235,18 @@ def trial_start(req: LicenseRequest):
 @app.post("/validate")
 def validate(req: LicenseRequest):
     with get_conn() as conn, get_cursor(conn) as cur:
+        provided_key = str((req.license_key or "")).strip()
+        # Wymuś podanie kodu, jeśli lokalnie nie zapisano go jeszcze na tym komputerze.
+        # Dzięki temu świeża instalacja zawsze przejdzie przez ekran aktywacji.
+        if settings.require_key_on_first_run and not provided_key:
+            _write_audit(cur, "validate_needs_activation_no_local_key", req.model_dump())
+            return sign_payload(
+                {
+                    "status": "needs_activation",
+                    "message": "Aby uruchomić program na tym komputerze, podaj kod licencji.",
+                }
+            )
+
         lic = _find_active_license_for_machine(cur, req.app_id, req.machine_id)
         now = now_utc()
         if lic:
@@ -277,7 +289,7 @@ def activate(req: LicenseRequest):
     with get_conn() as conn, get_cursor(conn) as cur:
         cur.execute(
             """
-            SELECT id, status, max_devices, expires_at
+            SELECT id, status, max_devices, expires_at, created_at
             FROM licenses
             WHERE app_id=%s AND license_key_hash=%s
             """,
@@ -290,7 +302,67 @@ def activate(req: LicenseRequest):
         if lic["status"] != "active":
             _write_audit(cur, "activate_blocked", req.model_dump())
             return sign_payload({"status": "inactive", "message": "License is blocked/inactive."})
-        if lic["expires_at"] is not None and now_utc() > lic["expires_at"]:
+        now = now_utc()
+        # Jeżeli to pierwsza aktywacja tego klucza, uruchom pełny okres ważności od teraz.
+        cur.execute(
+            "SELECT COUNT(*)::int AS c FROM license_activations WHERE license_id=%s",
+            (lic["id"],),
+        )
+        activation_rows = int(cur.fetchone()["c"])
+        if activation_rows == 0 and lic["expires_at"] is not None and lic.get("created_at"):
+            validity_days = None
+            try:
+                cur.execute(
+                    """
+                    SELECT payload_json
+                    FROM audit_logs
+                    WHERE event_type='admin_generate_license'
+                      AND (payload_json->>'license_id')::bigint = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (lic["id"],),
+                )
+                row = cur.fetchone()
+                if row and row.get("payload_json"):
+                    payload = row["payload_json"] or {}
+                    maybe_days = int(payload.get("validity_days", 0) or 0)
+                    if maybe_days > 0:
+                        validity_days = maybe_days
+            except Exception:
+                validity_days = None
+
+            try:
+                if not validity_days:
+                    validity_days = int(
+                        max(
+                            1,
+                            round((lic["expires_at"] - lic["created_at"]).total_seconds() / 86400.0),
+                        )
+                    )
+            except Exception:
+                validity_days = 30
+            new_expires = now + timedelta(days=validity_days)
+            cur.execute(
+                """
+                UPDATE licenses
+                SET expires_at=%s, updated_at=%s
+                WHERE id=%s
+                """,
+                (new_expires, now, lic["id"]),
+            )
+            lic["expires_at"] = new_expires
+            _write_audit(
+                cur,
+                "activate_first_use_expiry_reset",
+                {
+                    "app_id": req.app_id,
+                    "license_id": int(lic["id"]),
+                    "validity_days": int(validity_days),
+                },
+            )
+
+        if lic["expires_at"] is not None and now > lic["expires_at"]:
             _write_audit(cur, "activate_expired", req.model_dump())
             return sign_payload({"status": "inactive", "message": "License expired."})
 
@@ -305,7 +377,6 @@ def activate(req: LicenseRequest):
             (req.app_id, lic["id"], req.machine_id),
         )
         existing = cur.fetchone()
-        now = now_utc()
         if not existing:
             # Globalny limit osób/komputerów dla całej aplikacji (np. 2 osoby).
             app_limit = int(settings.max_active_machines_per_app or 0)
